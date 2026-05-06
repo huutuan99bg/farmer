@@ -15,6 +15,7 @@ Usage:
 
 from farmer.farmer import Farmer
 from farmer.farmer_sync import FarmerSync
+from farmer.human.human_iframe import HumanIframe
 from farmer._version import __version__
 
-__all__ = ["Farmer", "FarmerSync", "__version__"]
+__all__ = ["Farmer", "FarmerSync", "HumanIframe", "__version__"]
