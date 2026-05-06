@@ -393,13 +393,23 @@ class Page:
     async def _get_document(self) -> int:
         """Get the root DOM node ID. Lazy-enables DOM domain.
 
+        On first call, fetches full DOM tree (``depth: -1``) so that
+        ``querySelector`` can find deeply nested elements. Subsequent
+        calls return the cached root node ID.
+
         Returns:
             Root node ID.
         """
+        if self._root_node_id > 0:
+            return self._root_node_id
         await self._ensure_dom_enabled()
-        result = await self._cdp.send("DOM.getDocument", {"depth": 0})
+        result = await self._cdp.send("DOM.getDocument", {"depth": -1})
         self._root_node_id = result["root"]["nodeId"]
         return self._root_node_id
+
+    def _invalidate_document(self):
+        """Reset cached root node ID, forcing re-fetch on next query."""
+        self._root_node_id = 0
 
     @staticmethod
     def _is_xpath(selector: str) -> bool:
@@ -1063,3 +1073,262 @@ class DialogProxy:
     async def dismiss(self):
         """Dismiss the dialog."""
         await self._cdp.send("Page.handleJavaScriptDialog", {"accept": False})
+
+
+class CDPSessionProxy:
+    """Proxy that injects ``session_id`` into every CDP ``send()`` call.
+
+    Wraps a ``CDPConnection`` and transparently routes all commands
+    through a specific target session. Attribute access is delegated
+    to the underlying connection for event listeners, etc.
+
+    Args:
+        cdp: The underlying CDP connection.
+        session_id: Session ID from ``Target.attachToTarget``.
+    """
+
+    def __init__(self, cdp: CDPConnection, session_id: str):
+        self._cdp = cdp
+        self._session_id = session_id
+
+    async def send(self, method: str, params: dict = None, **kwargs) -> dict:
+        """Send a CDP command through the target session.
+
+        Args:
+            method: CDP method name.
+            params: Optional parameters.
+            **kwargs: Passed through to underlying ``send()``.
+
+        Returns:
+            CDP response result dict.
+        """
+        kwargs["session_id"] = self._session_id
+        return await self._cdp.send(method, params, **kwargs)
+
+    def __getattr__(self, name):
+        """Delegate attribute access to the underlying connection."""
+        return getattr(self._cdp, name)
+
+
+class SessionAwarePage(Page):
+    """Page subclass for OOPIF (cross-origin iframe) targets.
+
+    All CDP commands are routed through a dedicated session ID,
+    enabling DOM queries and operations inside cross-origin iframes.
+
+    Example:
+        >>> attach = await cdp.send("Target.attachToTarget", {...})
+        >>> page = SessionAwarePage(cdp, session_id=attach["sessionId"])
+    """
+
+    def __init__(
+        self,
+        cdp: CDPConnection,
+        session_id: str,
+        log: FarmerLogger = None,
+    ):
+        """Initialize a session-aware Page for an OOPIF target.
+
+        Args:
+            cdp: The parent CDP connection (shared WebSocket).
+            session_id: CDP session ID for the iframe target.
+            log: Structured logger instance.
+        """
+        proxy = CDPSessionProxy(cdp, session_id)
+        super().__init__(proxy, session_id=session_id, log=log)
+        self._real_cdp = cdp
+        self._oopif_session_id = session_id
+
+
+class IframePage(Page):
+    """Page subclass for accessing iframe content via frameId.
+
+    Uses ``Page.createIsolatedWorld`` to create an execution context
+    inside the iframe, then ``Runtime.evaluate`` for DOM queries.
+    This avoids stale nodeId issues with ``contentDocument``.
+
+    Example:
+        >>> desc = await cdp.send("DOM.describeNode", {"nodeId": nid})
+        >>> frame_id = desc["node"]["frameId"]
+        >>> iframe_page = IframePage(cdp, frame_id=frame_id)
+        >>> nid = await iframe_page._query_selector_id("#checkbox")
+    """
+
+    def __init__(
+        self,
+        cdp: CDPConnection,
+        frame_id: str,
+        log: FarmerLogger = None,
+    ):
+        """Initialize an IframePage for a specific frame.
+
+        Args:
+            cdp: The parent CDP connection.
+            frame_id: The iframe's frameId from ``DOM.describeNode``.
+            log: Structured logger instance.
+        """
+        super().__init__(cdp, log=log)
+        self._frame_id = frame_id
+        self._iframe_context_id: Optional[int] = None
+
+    async def _get_iframe_context(self) -> int:
+        """Get or create an isolated world execution context in the iframe.
+
+        Returns:
+            Execution context ID for the iframe.
+        """
+        if self._iframe_context_id:
+            return self._iframe_context_id
+
+        result = await self._cdp.send("Page.createIsolatedWorld", {
+            "frameId": self._frame_id,
+            "worldName": f"__farmer_iframe_{self._frame_id[:8]}",
+            "grantUniveralAccess": True,
+        })
+        self._iframe_context_id = result["executionContextId"]
+        return self._iframe_context_id
+
+    async def _eval_in_iframe(
+        self, expression: str, return_by_value: bool = True
+    ) -> Any:
+        """Evaluate JavaScript expression inside the iframe context.
+
+        Args:
+            expression: JavaScript expression to evaluate.
+            return_by_value: If ``True``, returns serialized value.
+                If ``False``, returns raw CDP result with ``objectId``
+                for DOM element references.
+
+        Returns:
+            The evaluated result value or CDP result dict.
+        """
+        context_id = await self._get_iframe_context()
+        params = {
+            "expression": expression,
+            "contextId": context_id,
+            "awaitPromise": True,
+        }
+        if return_by_value:
+            params["returnByValue"] = True
+
+        try:
+            result = await self._cdp.send("Runtime.evaluate", params)
+        except RuntimeError:
+            # Context may have been invalidated, recreate
+            self._iframe_context_id = None
+            context_id = await self._get_iframe_context()
+            params["contextId"] = context_id
+            result = await self._cdp.send("Runtime.evaluate", params)
+
+        if "exceptionDetails" in result:
+            return None
+        return result.get("result", {})
+
+    async def _get_document(self) -> int:
+        """Get the iframe's document root node ID.
+
+        Uses ``Runtime.evaluate`` to get the document node in the
+        iframe context, then resolves it to a DOM nodeId.
+
+        Returns:
+            Root node ID of the iframe document.
+        """
+        if self._root_node_id > 0:
+            return self._root_node_id
+
+        await self._ensure_dom_enabled()
+
+        context_id = await self._get_iframe_context()
+        result = await self._cdp.send("Runtime.evaluate", {
+            "expression": "document",
+            "contextId": context_id,
+        })
+        obj_id = result.get("result", {}).get("objectId")
+        if not obj_id:
+            raise RuntimeError("Cannot get iframe document")
+
+        node = await self._cdp.send("DOM.requestNode", {
+            "objectId": obj_id,
+        })
+        self._root_node_id = node.get("nodeId", 0)
+        if self._root_node_id == 0:
+            raise RuntimeError("Cannot resolve iframe document node")
+        return self._root_node_id
+
+    async def _query_selector_id(
+        self, selector: str, root: int = None
+    ) -> Optional[int]:
+        """Query the iframe DOM for a CSS selector.
+
+        Uses ``Runtime.evaluate`` with ``document.querySelector``
+        in the iframe context, then resolves the result to a nodeId.
+
+        Args:
+            selector: CSS selector string.
+            root: Ignored (always searches from iframe document root).
+
+        Returns:
+            Node ID of the first match, or ``None``.
+        """
+        safe_sel = selector.replace("\\", "\\\\").replace('"', '\\"')
+        result = await self._eval_in_iframe(
+            f'document.querySelector("{safe_sel}")',
+            return_by_value=False,
+        )
+        if not result or result.get("subtype") == "null":
+            return None
+
+        obj_id = result.get("objectId")
+        if not obj_id:
+            return None
+
+        await self._ensure_dom_enabled()
+        try:
+            node = await self._cdp.send("DOM.requestNode", {
+                "objectId": obj_id,
+            })
+            nid = node.get("nodeId", 0)
+            return nid if nid > 0 else None
+        except Exception:
+            return None
+
+    async def _query_selector_all_ids(
+        self, selector: str, root: int = None
+    ) -> list[int]:
+        """Query the iframe DOM for all matching elements.
+
+        Args:
+            selector: CSS selector string.
+            root: Ignored.
+
+        Returns:
+            List of matching node IDs.
+        """
+        safe_sel = selector.replace("\\", "\\\\").replace('"', '\\"')
+        result = await self._eval_in_iframe(
+            f'Array.from(document.querySelectorAll("{safe_sel}")).length'
+        )
+        count = result.get("value", 0) if result else 0
+        if count == 0:
+            return []
+
+        # Get each element individually
+        node_ids = []
+        for i in range(count):
+            r = await self._eval_in_iframe(
+                f'document.querySelectorAll("{safe_sel}")[{i}]',
+                return_by_value=False,
+            )
+            if r and r.get("objectId"):
+                await self._ensure_dom_enabled()
+                try:
+                    node = await self._cdp.send("DOM.requestNode", {
+                        "objectId": r["objectId"],
+                    })
+                    nid = node.get("nodeId", 0)
+                    if nid > 0:
+                        node_ids.append(nid)
+                except Exception:
+                    pass
+        return node_ids
+

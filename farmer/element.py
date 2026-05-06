@@ -443,26 +443,164 @@ class Element:
     async def content_frame(self) -> "Optional[Page]":
         """If this element is an ``<iframe>``, return a Page for its content.
 
+        Strategy:
+        1. Enable ``Target.setAutoAttach`` to discover OOPIF targets.
+        2. Get the iframe's ``src`` URL via ``DOM.getAttributes``.
+        3. Match iframe target from ``Target.getTargets`` by URL.
+        4. ``Target.attachToTarget`` → ``SessionAwarePage`` for OOPIF.
+        5. Fallback to ``IframePage`` (isolated world) for same-origin.
+
         Returns:
-            A ``Page`` instance connected to the iframe's document,
-            or ``None`` if this is not an iframe or the content
-            document is inaccessible.
+            A ``Page``-compatible instance for the iframe's content,
+            or ``None`` if not an iframe.
         """
         nid = await self._resolve()
         try:
             desc = await self._page._cdp.send("DOM.describeNode", {
-                "nodeId": nid, "depth": 1,
+                "nodeId": nid, "depth": 0,
             })
-            content_doc = desc.get("node", {}).get("contentDocument")
-            if content_doc:
-                from farmer.page.page import Page
-                frame_page = Page(self._page._cdp, log=self._page._log)
-                frame_page._frame_id = desc.get("node", {}).get("frameId", "")
-                frame_page._root_node_id = content_doc["nodeId"]
-                return frame_page
+            node = desc.get("node", {})
+            frame_id = node.get("frameId", "")
+
+            if not frame_id:
+                return None
+
+            # Get iframe src URL for target matching
+            iframe_src = ""
+            attrs = node.get("attributes", [])
+            for i in range(0, len(attrs) - 1, 2):
+                if attrs[i] == "src":
+                    iframe_src = attrs[i + 1]
+                    break
+            # Fallback: get src via DOM.getAttributes
+            if not iframe_src:
+                try:
+                    iframe_src = await self.get_attribute("src") or ""
+                except Exception:
+                    pass
+
+            # Enable auto-attach to discover OOPIF targets
+            try:
+                await self._page._cdp.send("Target.setAutoAttach", {
+                    "autoAttach": True,
+                    "waitForDebuggerOnStart": False,
+                    "flatten": True,
+                })
+            except Exception:
+                pass
+
+            # Try OOPIF attachment
+            oopif_page = await self._attach_oopif(frame_id, iframe_src)
+            if oopif_page:
+                return oopif_page
+
+            # Fallback: same-origin iframe via createIsolatedWorld
+            from farmer.page.page import IframePage
+            return IframePage(
+                self._page._cdp,
+                frame_id=frame_id,
+                log=self._page._log,
+            )
+
         except Exception:
             pass
         return None
+
+    async def _attach_oopif(
+        self, frame_id: str, iframe_src: str = ""
+    ) -> "Optional[Page]":
+        """Attach to an out-of-process iframe target.
+
+        Discovers iframe targets via ``Target.getTargets`` and matches
+        by URL prefix. Attaches to create a dedicated CDP session.
+
+        Args:
+            frame_id: The iframe's frameId from ``DOM.describeNode``.
+            iframe_src: The iframe's ``src`` URL for target matching.
+
+        Returns:
+            A ``SessionAwarePage`` for the OOPIF, or ``None``.
+        """
+        try:
+            targets = await self._page._cdp.send("Target.getTargets")
+            target_infos = targets.get("targetInfos", [])
+
+            # Find iframe target matching by src URL
+            target_id = None
+            iframe_candidates = []
+            for t in target_infos:
+                if t.get("type") != "iframe":
+                    continue
+                iframe_candidates.append(t)
+
+            if iframe_src and iframe_candidates:
+                for t in iframe_candidates:
+                    t_url = t.get("url", "")
+                    # Exact full URL match (includes hash fragment)
+                    if t_url == iframe_src:
+                        target_id = t["targetId"]
+                        break
+
+                if not target_id:
+                    # Match by URL path including hash (before query params)
+                    src_base = iframe_src.split("?")[0]
+                    for t in iframe_candidates:
+                        t_base = t.get("url", "").split("?")[0]
+                        if src_base and t_base == src_base:
+                            target_id = t["targetId"]
+                            break
+
+                if not target_id:
+                    # Match by URL path without hash
+                    src_path = iframe_src.split("#")[0].split("?")[0]
+                    for t in iframe_candidates:
+                        t_path = t.get("url", "").split("#")[0].split("?")[0]
+                        if src_path and t_path == src_path:
+                            target_id = t["targetId"]
+                            break
+
+            if not target_id and iframe_candidates:
+                # Fallback: pick first iframe target
+                target_id = iframe_candidates[0]["targetId"]
+
+            if not target_id:
+                return None
+
+            # Attach to target → get sessionId
+            attach = await self._page._cdp.send(
+                "Target.attachToTarget",
+                {"targetId": target_id, "flatten": True},
+            )
+            session_id = attach.get("sessionId")
+            if not session_id:
+                return None
+
+            # Enable DOM in OOPIF session
+            await self._page._cdp.send(
+                "DOM.enable", session_id=session_id,
+            )
+
+            # Get document root in OOPIF session
+            doc = await self._page._cdp.send(
+                "DOM.getDocument", {"depth": -1},
+                session_id=session_id,
+            )
+            root_nid = doc.get("root", {}).get("nodeId", 0)
+            if root_nid == 0:
+                return None
+
+            from farmer.page.page import SessionAwarePage
+            frame_page = SessionAwarePage(
+                self._page._cdp,
+                session_id=session_id,
+                log=self._page._log,
+            )
+            frame_page._frame_id = frame_id
+            frame_page._root_node_id = root_nid
+            return frame_page
+
+        except Exception:
+            return None
 
     def __repr__(self):
         return f"Element({self._selector!r})"

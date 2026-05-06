@@ -175,7 +175,8 @@ class CDPConnection:
         self._log.info("Reconnected successfully")
 
     async def send(
-        self, method: str, params: dict = None, timeout: float = 30
+        self, method: str, params: dict = None, timeout: float = 30,
+        session_id: str = None,
     ) -> dict:
         """Send CDP command and wait for response.
 
@@ -187,6 +188,9 @@ class CDPConnection:
             method: CDP method name (e.g., ``"Page.navigate"``).
             params: Optional parameters dict for the CDP method.
             timeout: Maximum seconds to wait for a response.
+            session_id: Optional CDP session ID for OOPIF targets.
+                When provided, the command is routed to the specific
+                target session (e.g., a cross-origin iframe).
 
         Returns:
             The ``result`` field from the CDP response as a dict.
@@ -214,6 +218,8 @@ class CDPConnection:
         payload: Dict[str, Any] = {"id": msg_id, "method": method}
         if params:
             payload["params"] = params
+        if session_id:
+            payload["sessionId"] = session_id
 
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
