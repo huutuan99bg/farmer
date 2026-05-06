@@ -401,16 +401,30 @@ class Page:
         self._root_node_id = result["root"]["nodeId"]
         return self._root_node_id
 
+    @staticmethod
+    def _is_xpath(selector: str) -> bool:
+        """Check if a selector is XPath (starts with ``/`` or ``//``)."""
+        s = selector.lstrip()
+        return s.startswith("/") or s.startswith("(")
+
     async def _query_selector_id(self, selector: str, root: int = None) -> Optional[int]:
         """Query DOM for a selector, return the first matching node ID.
 
+        Supports both CSS selectors and XPath expressions.
+        XPath is auto-detected when the selector starts with ``/``
+        or ``//``.
+
         Args:
-            selector: CSS selector.
-            root: Root node ID to search within. If ``None``, uses document root.
+            selector: CSS selector or XPath expression.
+            root: Root node ID to search within. If ``None``, uses
+                document root. Only used for CSS selectors.
 
         Returns:
             Node ID of the first match, or ``None`` if not found.
         """
+        if self._is_xpath(selector):
+            return await self._xpath_first(selector)
+
         if root is None:
             root = await self._get_document()
         try:
@@ -425,13 +439,18 @@ class Page:
     async def _query_selector_all_ids(self, selector: str, root: int = None) -> list[int]:
         """Query DOM for all nodes matching a selector.
 
+        Supports both CSS selectors and XPath expressions.
+
         Args:
-            selector: CSS selector.
+            selector: CSS selector or XPath expression.
             root: Root node ID. If ``None``, uses document root.
 
         Returns:
             List of matching node IDs (may be empty).
         """
+        if self._is_xpath(selector):
+            return await self._xpath_all(selector)
+
         if root is None:
             root = await self._get_document()
         try:
@@ -439,6 +458,60 @@ class Page:
                 "nodeId": root, "selector": selector,
             })
             return [nid for nid in result.get("nodeIds", []) if nid > 0]
+        except Exception:
+            return []
+
+    async def _xpath_first(self, xpath: str) -> Optional[int]:
+        """Find the first node matching an XPath expression.
+
+        Uses ``DOM.performSearch`` + ``DOM.getSearchResults`` to
+        evaluate XPath against the current document.
+
+        Args:
+            xpath: XPath expression (e.g., ``"//div[@id='test']"``).
+
+        Returns:
+            Node ID of the first match, or ``None``.
+        """
+        try:
+            await self._ensure_dom_enabled()
+            search = await self._cdp.send("DOM.performSearch", {"query": xpath})
+            search_id = search.get("searchId", "")
+            count = search.get("resultCount", 0)
+            if count == 0:
+                await self._cdp.send("DOM.discardSearchResults", {"searchId": search_id})
+                return None
+            results = await self._cdp.send("DOM.getSearchResults", {
+                "searchId": search_id, "fromIndex": 0, "toIndex": 1,
+            })
+            await self._cdp.send("DOM.discardSearchResults", {"searchId": search_id})
+            nids = results.get("nodeIds", [])
+            return nids[0] if nids and nids[0] > 0 else None
+        except Exception:
+            return None
+
+    async def _xpath_all(self, xpath: str) -> list[int]:
+        """Find all nodes matching an XPath expression.
+
+        Args:
+            xpath: XPath expression.
+
+        Returns:
+            List of matching node IDs (may be empty).
+        """
+        try:
+            await self._ensure_dom_enabled()
+            search = await self._cdp.send("DOM.performSearch", {"query": xpath})
+            search_id = search.get("searchId", "")
+            count = search.get("resultCount", 0)
+            if count == 0:
+                await self._cdp.send("DOM.discardSearchResults", {"searchId": search_id})
+                return []
+            results = await self._cdp.send("DOM.getSearchResults", {
+                "searchId": search_id, "fromIndex": 0, "toIndex": count,
+            })
+            await self._cdp.send("DOM.discardSearchResults", {"searchId": search_id})
+            return [nid for nid in results.get("nodeIds", []) if nid > 0]
         except Exception:
             return []
 
