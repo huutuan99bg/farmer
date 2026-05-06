@@ -52,4 +52,4 @@ version = {attr = "farmer._version.__version__"}
 include = ["farmer*"]
 
 [tool.setuptools.package-data]
-farmer = ["detect_alert.md", "detect_alert_vi.md"]
+farmer = ["py.typed", "detect_alert.md", "detect_alert_vi.md"]
